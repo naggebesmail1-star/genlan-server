@@ -1,0 +1,11 @@
+{
+  "Version": 1,
+  "Hash": "kx+k0YmQ894aBgjbUttcxJjYHSd1TUc19aZSKUSXixI=",
+  "Source": "GenLAN.Server",
+  "BasePath": "_content/GenLAN.Server",
+  "Mode": "Default",
+  "ManifestType": "Publish",
+  "ReferencedProjectsConfiguration": [],
+  "DiscoveryPatterns": [],
+  "Assets": []
+}
