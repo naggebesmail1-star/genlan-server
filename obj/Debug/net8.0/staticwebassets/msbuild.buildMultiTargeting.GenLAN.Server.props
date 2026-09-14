@@ -1,3 +1,0 @@
-﻿<Project>
-  <Import Project="..\build\GenLAN.Server.props" />
-</Project>
