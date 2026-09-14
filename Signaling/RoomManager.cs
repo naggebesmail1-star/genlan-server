@@ -1,5 +1,8 @@
 using System.Collections.Concurrent;
 using System.Net;
+using System.Net.WebSockets;
+using System.Text;
+using System.Text.Json;
 using Serilog;
 
 namespace GenLAN.Server.Signaling;
@@ -40,7 +43,39 @@ public enum RoomState
 public class RoomManager
 {
     private readonly ConcurrentDictionary<string, Room> _rooms = new();
+    private readonly ConcurrentDictionary<string, WebSocket> _sockets = new();
     private readonly Timer _cleanupTimer;
+
+    public void RegisterSocket(string connectionId, WebSocket ws) => _sockets[connectionId] = ws;
+    public void UnregisterSocket(string connectionId) => _sockets.TryRemove(connectionId, out _);
+
+    public async Task SendToConnectionAsync(string connectionId, object message)
+    {
+        if (_sockets.TryGetValue(connectionId, out var ws) && ws.State == WebSocketState.Open)
+        {
+            var json = JsonSerializer.Serialize(message);
+            var bytes = Encoding.UTF8.GetBytes(json);
+            try
+            {
+                await ws.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(ex, "[RoomManager] Failed to send to {ConnId}", connectionId);
+            }
+        }
+    }
+
+    public async Task ForwardToOtherParticipantAsync(string currentConnectionId, string roomId, object message)
+    {
+        var room = GetRoom(roomId);
+        if (room == null) return;
+        var targetId = room.Host?.ConnectionId == currentConnectionId ? room.Client?.ConnectionId : room.Host?.ConnectionId;
+        if (!string.IsNullOrEmpty(targetId))
+        {
+            await SendToConnectionAsync(targetId, message);
+        }
+    }
 
     // Valid characters for room codes (excluding confusable characters: 0/O, 1/I/L)
     private const string CODE_CHARS = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";

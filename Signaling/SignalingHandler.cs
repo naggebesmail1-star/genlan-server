@@ -27,6 +27,7 @@ public class SignalingHandler
     public async Task HandleAsync()
     {
         Log.Information("[Signal] Client connected: {ConnId} from {IP}", _connectionId, _remoteIp);
+        _rooms.RegisterSocket(_connectionId, _ws);
 
         var buffer = new byte[8192];
         try
@@ -48,6 +49,8 @@ public class SignalingHandler
         }
         finally
         {
+            _rooms.UnregisterSocket(_connectionId);
+
             // Cleanup: close room if this was the host
             var room = _rooms.FindRoomByConnection(_connectionId);
             if (room != null)
@@ -92,6 +95,19 @@ public class SignalingHandler
                 case "GET_RELAY":
                     var relayRoomId = data.GetProperty("roomId").GetString()!;
                     await HandleGetRelayAsync(relayRoomId, correlationId);
+                    break;
+
+                case "RELAY_PACKET":
+                    var rRoomId = data.TryGetProperty("roomId", out var rEl) ? rEl.GetString() : null;
+                    var rPayload = data.TryGetProperty("payload", out var pEl) ? pEl.GetString() : null;
+                    if (!string.IsNullOrEmpty(rRoomId) && !string.IsNullOrEmpty(rPayload))
+                    {
+                        await _rooms.ForwardToOtherParticipantAsync(_connectionId, rRoomId, new
+                        {
+                            type = "RELAY_PACKET",
+                            data = new { payload = rPayload }
+                        });
+                    }
                     break;
 
                 default:
@@ -159,21 +175,6 @@ public class SignalingHandler
                     publicKey = room.Host?.PublicKey ?? ""
                 },
                 virtualIp = "10.77.0.2" // Client always gets .2
-            }
-        });
-
-        // Notify host that client joined
-        await NotifyHostAsync(room, new
-        {
-            type = $"PEER_JOINED_{roomId}",
-            data = new
-            {
-                peerEndpoint = new
-                {
-                    publicEndpoint = _remoteIp + ":0",
-                    privateEndpoint = "",
-                    publicKey = ""
-                }
             }
         });
     }
@@ -255,10 +256,11 @@ public class SignalingHandler
 
     private async Task NotifyHostAsync(Room room, object message)
     {
-        // In a real implementation, we'd have a concurrent dictionary of WebSocket connections
-        // For now, log that we would notify the host
-        Log.Debug("[Signal] Would notify host of room {RoomId}", room.Id);
-        // Production implementation: look up host WebSocket by connectionId and send
+        if (!string.IsNullOrEmpty(room.Host?.ConnectionId))
+        {
+            await _rooms.SendToConnectionAsync(room.Host.ConnectionId, message);
+            Log.Information("[Signal] Notified host {HostConn} of room {RoomId}", room.Host.ConnectionId, room.Id);
+        }
     }
 
     private async Task SendAsync(object message)
