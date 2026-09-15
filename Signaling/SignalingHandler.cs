@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Linq;
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
@@ -63,15 +64,31 @@ public class SignalingHandler
             var left = room.RemoveParticipant(_connectionId);
             if (left != null)
             {
-                Log.Information("[Signal] Player {ConnId} (IP: {Ip}) left room {RoomId}. Remaining: {Count}",
-                    _connectionId, left.VirtualIp, room.Id, room.PlayerCount);
+                Log.Information("[Signal] Player {ConnId} (IP: {Ip}, IsHost: {IsHost}) left room {RoomId}. Remaining: {Count}",
+                    _connectionId, left.VirtualIp, left.IsHost, room.Id, room.PlayerCount);
 
-                if (room.PlayerCount > 0)
+                if (left.IsHost)
                 {
+                    // Host disconnected -> Close room and kick all clients cleanly!
+                    await _rooms.BroadcastToRoomOthersAsync(_connectionId, room.Id, new
+                    {
+                        type = "ROOM_CLOSED",
+                        data = new { reason = "Host closed the room" }
+                    });
+                    _rooms.CloseRoom(room.Id);
+                }
+                else if (room.PlayerCount > 0)
+                {
+                    var remainingIps = room.Participants.Values.Select(p => p.VirtualIp).ToList();
                     await _rooms.BroadcastToRoomOthersAsync(_connectionId, room.Id, new
                     {
                         type = "PEER_LEFT",
-                        data = new { virtualIp = left.VirtualIp, totalPlayers = room.PlayerCount }
+                        data = new
+                        {
+                            virtualIp = left.VirtualIp,
+                            totalPlayers = room.PlayerCount,
+                            peers = remainingIps
+                        }
                     });
                 }
                 else
@@ -117,6 +134,11 @@ public class SignalingHandler
                     }
                     break;
 
+                case "LEAVE_ROOM":
+                    // Graceful exit
+                    await _ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "Leave", CancellationToken.None);
+                    break;
+
                 default:
                     Log.Warning("[Signal] Unknown message: {Type} from {ConnId}", type, _connectionId);
                     break;
@@ -144,7 +166,8 @@ public class SignalingHandler
             {
                 roomId = room.Id,
                 virtualIp = host.VirtualIp,
-                totalPlayers = room.PlayerCount
+                totalPlayers = room.PlayerCount,
+                peers = new[] { host.VirtualIp }
             }
         });
 
@@ -165,7 +188,9 @@ public class SignalingHandler
             return;
         }
 
-        // 1. Confirm to the joining player
+        var allIps = room.Participants.Values.Select(p => p.VirtualIp).ToList();
+
+        // 1. Confirm to the joining player with full active peer list
         await SendAsync(new
         {
             type = "ROOM_JOINED",
@@ -174,7 +199,8 @@ public class SignalingHandler
             {
                 roomId = room.Id,
                 virtualIp = participant.VirtualIp,
-                totalPlayers = room.PlayerCount
+                totalPlayers = room.PlayerCount,
+                peers = allIps
             }
         });
 
@@ -186,7 +212,8 @@ public class SignalingHandler
             {
                 roomId = room.Id,
                 virtualIp = participant.VirtualIp,
-                totalPlayers = room.PlayerCount
+                totalPlayers = room.PlayerCount,
+                peers = allIps
             }
         });
 
