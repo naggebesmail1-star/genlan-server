@@ -1,50 +1,112 @@
+﻿using System;
 using System.Collections.Concurrent;
-using System.Net;
+using System.Collections.Generic;
+using System.Linq;
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
 using Serilog;
 
 namespace GenLAN.Server.Signaling;
 
-public class Room
-{
-    public string Id { get; set; } = "";
-    public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
-    public DateTime ExpiresAt { get; set; } = DateTime.UtcNow.AddMinutes(30);
-    public RoomParticipant? Host { get; set; }
-    public RoomParticipant? Client { get; set; }
-    public RoomState State { get; set; } = RoomState.WaitingForClient;
-
-    public bool IsExpired => DateTime.UtcNow > ExpiresAt;
-    public bool IsFull => Host != null && Client != null;
-}
-
 public class RoomParticipant
 {
     public string ConnectionId { get; set; } = "";
-    public string? PublicEndpoint { get; set; }
-    public string? PrivateEndpoint { get; set; }
-    public string? PublicKey { get; set; }
-    public string? RelaySessionId { get; set; }
+    public string VirtualIp { get; set; } = "";
+    public int IpSlot { get; set; }
+    public bool IsHost { get; set; }
+    public DateTime JoinedAt { get; set; } = DateTime.UtcNow;
 }
 
-public enum RoomState
+public class Room
 {
-    WaitingForClient,
-    NegotiatingP2P,
-    Active,
-    Closed
+    public const int MAX_PLAYERS = 16;
+
+    public string Id { get; set; } = "";
+    public string HostConnectionId { get; set; } = "";
+    public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+    public DateTime ExpiresAt { get; set; } = DateTime.UtcNow.AddHours(2);
+    public ConcurrentDictionary<string, RoomParticipant> Participants { get; } = new();
+    private readonly HashSet<int> _usedSlots = new();
+    private readonly object _lock = new();
+
+    public bool IsExpired => DateTime.UtcNow > ExpiresAt;
+    public bool IsFull => Participants.Count >= MAX_PLAYERS;
+    public int PlayerCount => Participants.Count;
+
+    public RoomParticipant? AddParticipant(string connectionId, bool isHost)
+    {
+        lock (_lock)
+        {
+            if (IsFull && !isHost) return null;
+
+            int slot;
+            if (isHost)
+            {
+                slot = 1;
+                _usedSlots.Add(1);
+            }
+            else
+            {
+                slot = -1;
+                for (int i = 2; i <= MAX_PLAYERS; i++)
+                {
+                    if (!_usedSlots.Contains(i))
+                    {
+                        slot = i;
+                        _usedSlots.Add(i);
+                        break;
+                    }
+                }
+                if (slot == -1) return null;
+            }
+
+            var participant = new RoomParticipant
+            {
+                ConnectionId = connectionId,
+                VirtualIp = $"10.77.0.{slot}",
+                IpSlot = slot,
+                IsHost = isHost
+            };
+
+            Participants[connectionId] = participant;
+            return participant;
+        }
+    }
+
+    public RoomParticipant? RemoveParticipant(string connectionId)
+    {
+        lock (_lock)
+        {
+            if (Participants.TryRemove(connectionId, out var p))
+            {
+                _usedSlots.Remove(p.IpSlot);
+                return p;
+            }
+            return null;
+        }
+    }
 }
 
 /// <summary>
-/// In-memory room manager. Handles room lifecycle and cleanup.
+/// In-memory room manager supporting up to 16 players per room.
 /// </summary>
 public class RoomManager
 {
     private readonly ConcurrentDictionary<string, Room> _rooms = new();
     private readonly ConcurrentDictionary<string, WebSocket> _sockets = new();
     private readonly Timer _cleanupTimer;
+
+    private const string CODE_CHARS = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+    private const int CODE_LENGTH = 5;
+
+    public RoomManager()
+    {
+        _cleanupTimer = new Timer(_ => CleanupExpiredRooms(), null,
+            TimeSpan.FromMinutes(5), TimeSpan.FromMinutes(5));
+    }
 
     public void RegisterSocket(string connectionId, WebSocket ws) => _sockets[connectionId] = ws;
     public void UnregisterSocket(string connectionId) => _sockets.TryRemove(connectionId, out _);
@@ -66,40 +128,45 @@ public class RoomManager
         }
     }
 
-    public async Task ForwardToOtherParticipantAsync(string currentConnectionId, string roomId, object message)
+    public async Task BroadcastToRoomOthersAsync(string senderConnectionId, string roomId, object message)
     {
         var room = GetRoom(roomId);
         if (room == null) return;
-        var targetId = room.Host?.ConnectionId == currentConnectionId ? room.Client?.ConnectionId : room.Host?.ConnectionId;
-        if (!string.IsNullOrEmpty(targetId))
+
+        foreach (var p in room.Participants.Values)
         {
-            await SendToConnectionAsync(targetId, message);
+            if (p.ConnectionId != senderConnectionId)
+            {
+                await SendToConnectionAsync(p.ConnectionId, message);
+            }
         }
     }
 
-    // Valid characters for room codes (excluding confusable characters: 0/O, 1/I/L)
-    private const string CODE_CHARS = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
-    private const int CODE_LENGTH = 5;
-
-    public RoomManager()
+    public async Task BroadcastToAllInRoomAsync(string roomId, object message)
     {
-        // Cleanup expired rooms every 5 minutes
-        _cleanupTimer = new Timer(_ => CleanupExpiredRooms(), null,
-            TimeSpan.FromMinutes(5), TimeSpan.FromMinutes(5));
+        var room = GetRoom(roomId);
+        if (room == null) return;
+
+        foreach (var p in room.Participants.Values)
+        {
+            await SendToConnectionAsync(p.ConnectionId, message);
+        }
     }
 
-    public Room CreateRoom(string connectionId)
+    public RoomParticipant CreateRoom(string connectionId, out Room room)
     {
         var id = GenerateRoomId();
-        var room = new Room
+        room = new Room
         {
             Id = id,
-            Host = new RoomParticipant { ConnectionId = connectionId }
+            HostConnectionId = connectionId
         };
 
+        var host = room.AddParticipant(connectionId, isHost: true)!;
         _rooms[id] = room;
-        Log.Information("[RoomManager] Created room {RoomId} for {ConnectionId}", id, connectionId);
-        return room;
+        Log.Information("[RoomManager] Created room {RoomId} for host {ConnectionId} (IP: {Ip})",
+            id, connectionId, host.VirtualIp);
+        return host;
     }
 
     public Room? GetRoom(string roomId)
@@ -113,9 +180,11 @@ public class RoomManager
         return room;
     }
 
-    public bool TryJoinRoom(string roomId, string connectionId, out Room? room)
+    public bool TryJoinRoom(string roomId, string connectionId, out Room? room, out RoomParticipant? participant)
     {
         room = GetRoom(roomId.ToUpperInvariant());
+        participant = null;
+
         if (room == null)
         {
             Log.Warning("[RoomManager] Room {RoomId} not found", roomId);
@@ -124,13 +193,15 @@ public class RoomManager
 
         if (room.IsFull)
         {
-            Log.Warning("[RoomManager] Room {RoomId} is full", roomId);
+            Log.Warning("[RoomManager] Room {RoomId} is full (16 players)", roomId);
             return false;
         }
 
-        room.Client = new RoomParticipant { ConnectionId = connectionId };
-        room.State = RoomState.NegotiatingP2P;
-        Log.Information("[RoomManager] Client joined room {RoomId}", roomId);
+        participant = room.AddParticipant(connectionId, isHost: false);
+        if (participant == null) return false;
+
+        Log.Information("[RoomManager] Player {ConnectionId} joined room {RoomId} (Assigned IP: {Ip}, Total: {Count}/16)",
+            connectionId, roomId, participant.VirtualIp, room.PlayerCount);
         return true;
     }
 
@@ -142,9 +213,7 @@ public class RoomManager
 
     public Room? FindRoomByConnection(string connectionId)
     {
-        return _rooms.Values.FirstOrDefault(r =>
-            r.Host?.ConnectionId == connectionId ||
-            r.Client?.ConnectionId == connectionId);
+        return _rooms.Values.FirstOrDefault(r => r.Participants.ContainsKey(connectionId));
     }
 
     private static string GenerateRoomId()

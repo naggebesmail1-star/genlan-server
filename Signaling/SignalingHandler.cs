@@ -1,24 +1,15 @@
-﻿using System.Net.WebSockets;
+﻿using System;
+using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
 using Serilog;
 
 namespace GenLAN.Server.Signaling;
 
 /// <summary>
-/// Handles one WebSocket connection.
-/// Protocol (client → server): { type, data?, correlationId? }
-/// Server → client push: { type, data?, correlationId? }
-///
-/// Supported types (client sends):
-///   CREATE_ROOM                      → ROOM_CREATED { roomId }
-///   JOIN_ROOM  { roomId }            → ROOM_JOINED { roomId } | ROOM_NOT_FOUND
-///   RELAY_PACKET { roomId, payload } → forwarded to other participant
-///
-/// Push from server:
-///   PEER_JOINED { roomId }           → to host when client joins
-///   PEER_LEFT                        → to remaining participant when other disconnects
-///   RELAY_PACKET { payload }         → forwarded relay packet
+/// Handles one WebSocket connection for the 16-player virtual LAN.
 /// </summary>
 public class SignalingHandler
 {
@@ -69,14 +60,25 @@ public class SignalingHandler
         var room = _rooms.FindRoomByConnection(_connectionId);
         if (room != null)
         {
-            var peerId = room.Host?.ConnectionId == _connectionId
-                ? room.Client?.ConnectionId
-                : room.Host?.ConnectionId;
+            var left = room.RemoveParticipant(_connectionId);
+            if (left != null)
+            {
+                Log.Information("[Signal] Player {ConnId} (IP: {Ip}) left room {RoomId}. Remaining: {Count}",
+                    _connectionId, left.VirtualIp, room.Id, room.PlayerCount);
 
-            if (!string.IsNullOrEmpty(peerId))
-                await _rooms.SendToConnectionAsync(peerId, new { type = "PEER_LEFT" });
-
-            _rooms.CloseRoom(room.Id);
+                if (room.PlayerCount > 0)
+                {
+                    await _rooms.BroadcastToRoomOthersAsync(_connectionId, room.Id, new
+                    {
+                        type = "PEER_LEFT",
+                        data = new { virtualIp = left.VirtualIp, totalPlayers = room.PlayerCount }
+                    });
+                }
+                else
+                {
+                    _rooms.CloseRoom(room.Id);
+                }
+            }
         }
 
         Log.Information("[Signal] Disconnected: {ConnId}", _connectionId);
@@ -94,8 +96,6 @@ public class SignalingHandler
             var corrId = root.TryGetProperty("correlationId", out var cEl) ? cEl.GetString() : null;
             var data = root.TryGetProperty("data", out var dEl) ? dEl : default;
 
-            Log.Debug("[Signal] {ConnId} -> {Type}", _connectionId, type);
-
             switch (type)
             {
                 case "CREATE_ROOM":
@@ -112,7 +112,7 @@ public class SignalingHandler
                     var rPayload = data.TryGetProperty("payload", out var pEl) ? pEl.GetString() : null;
                     if (!string.IsNullOrEmpty(rRoomId) && !string.IsNullOrEmpty(rPayload))
                     {
-                        await _rooms.ForwardToOtherParticipantAsync(_connectionId, rRoomId,
+                        await _rooms.BroadcastToRoomOthersAsync(_connectionId, rRoomId,
                             new { type = "RELAY_PACKET", data = new { payload = rPayload } });
                     }
                     break;
@@ -134,21 +134,26 @@ public class SignalingHandler
 
     private async Task HandleCreateRoomAsync(string? corrId)
     {
-        var room = _rooms.CreateRoom(_connectionId);
+        var host = _rooms.CreateRoom(_connectionId, out var room);
 
         await SendAsync(new
         {
             type = "ROOM_CREATED",
             correlationId = corrId,
-            data = new { roomId = room.Id }
+            data = new
+            {
+                roomId = room.Id,
+                virtualIp = host.VirtualIp,
+                totalPlayers = room.PlayerCount
+            }
         });
 
-        Log.Information("[Signal] Room {RoomId} created by {ConnId}", room.Id, _connectionId);
+        Log.Information("[Signal] Room {RoomId} created by {ConnId} (IP: {Ip})", room.Id, _connectionId, host.VirtualIp);
     }
 
     private async Task HandleJoinRoomAsync(string roomId, string? corrId)
     {
-        if (!_rooms.TryJoinRoom(roomId, _connectionId, out var room) || room == null)
+        if (!_rooms.TryJoinRoom(roomId, _connectionId, out var room, out var participant) || room == null || participant == null)
         {
             await SendAsync(new
             {
@@ -156,29 +161,37 @@ public class SignalingHandler
                 correlationId = corrId,
                 data = new { roomId }
             });
-            Log.Warning("[Signal] Room {RoomId} not found for {ConnId}", roomId, _connectionId);
+            Log.Warning("[Signal] Room {RoomId} not found/full for {ConnId}", roomId, _connectionId);
             return;
         }
 
-        // Confirm to joining client
+        // 1. Confirm to the joining player
         await SendAsync(new
         {
             type = "ROOM_JOINED",
             correlationId = corrId,
-            data = new { roomId = room.Id }
+            data = new
+            {
+                roomId = room.Id,
+                virtualIp = participant.VirtualIp,
+                totalPlayers = room.PlayerCount
+            }
         });
 
-        // Immediately notify host that a client joined
-        if (!string.IsNullOrEmpty(room.Host?.ConnectionId))
+        // 2. Notify all existing participants in the room
+        await _rooms.BroadcastToRoomOthersAsync(_connectionId, room.Id, new
         {
-            await _rooms.SendToConnectionAsync(room.Host.ConnectionId, new
+            type = "PEER_JOINED",
+            data = new
             {
-                type = "PEER_JOINED",
-                data = new { roomId = room.Id }
-            });
-        }
+                roomId = room.Id,
+                virtualIp = participant.VirtualIp,
+                totalPlayers = room.PlayerCount
+            }
+        });
 
-        Log.Information("[Signal] Client {ConnId} joined room {RoomId}", _connectionId, roomId);
+        Log.Information("[Signal] Player {ConnId} joined room {RoomId} (Assigned IP: {Ip}, Total: {Count}/16)",
+            _connectionId, roomId, participant.VirtualIp, room.PlayerCount);
     }
 
     private async Task SendAsync(object message)
