@@ -1,4 +1,4 @@
-using System.Net.WebSockets;
+﻿using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
 using Serilog;
@@ -6,8 +6,19 @@ using Serilog;
 namespace GenLAN.Server.Signaling;
 
 /// <summary>
-/// Handles one WebSocket connection from a client.
-/// Processes signaling messages: CREATE_ROOM, JOIN_ROOM, SEND_ENDPOINT, GET_RELAY.
+/// Handles one WebSocket connection.
+/// Protocol (client → server): { type, data?, correlationId? }
+/// Server → client push: { type, data?, correlationId? }
+///
+/// Supported types (client sends):
+///   CREATE_ROOM                      → ROOM_CREATED { roomId }
+///   JOIN_ROOM  { roomId }            → ROOM_JOINED { roomId } | ROOM_NOT_FOUND
+///   RELAY_PACKET { roomId, payload } → forwarded to other participant
+///
+/// Push from server:
+///   PEER_JOINED { roomId }           → to host when client joins
+///   PEER_LEFT                        → to remaining participant when other disconnects
+///   RELAY_PACKET { payload }         → forwarded relay packet
 /// </summary>
 public class SignalingHandler
 {
@@ -26,40 +37,49 @@ public class SignalingHandler
 
     public async Task HandleAsync()
     {
-        Log.Information("[Signal] Client connected: {ConnId} from {IP}", _connectionId, _remoteIp);
+        Log.Information("[Signal] Connected: {ConnId} from {IP}", _connectionId, _remoteIp);
         _rooms.RegisterSocket(_connectionId, _ws);
 
-        var buffer = new byte[8192];
+        var buffer = new byte[65536];
         try
         {
             while (_ws.State == WebSocketState.Open)
             {
-                var result = await _ws.ReceiveAsync(buffer, CancellationToken.None);
+                using var ms = new System.IO.MemoryStream();
+                WebSocketReceiveResult result;
+                do
+                {
+                    result = await _ws.ReceiveAsync(buffer, CancellationToken.None);
+                    if (result.MessageType == WebSocketMessageType.Close) goto done;
+                    ms.Write(buffer, 0, result.Count);
+                } while (!result.EndOfMessage);
 
-                if (result.MessageType == WebSocketMessageType.Close)
-                    break;
-
-                var json = Encoding.UTF8.GetString(buffer, 0, result.Count);
+                var json = Encoding.UTF8.GetString(ms.ToArray());
                 await ProcessMessageAsync(json);
             }
         }
         catch (Exception ex)
         {
-            Log.Warning(ex, "[Signal] Connection error for {ConnId}", _connectionId);
+            Log.Debug(ex, "[Signal] Connection error for {ConnId}", _connectionId);
         }
-        finally
+
+        done:
+        _rooms.UnregisterSocket(_connectionId);
+
+        var room = _rooms.FindRoomByConnection(_connectionId);
+        if (room != null)
         {
-            _rooms.UnregisterSocket(_connectionId);
+            var peerId = room.Host?.ConnectionId == _connectionId
+                ? room.Client?.ConnectionId
+                : room.Host?.ConnectionId;
 
-            // Cleanup: close room if this was the host
-            var room = _rooms.FindRoomByConnection(_connectionId);
-            if (room != null)
-            {
-                _rooms.CloseRoom(room.Id);
-            }
+            if (!string.IsNullOrEmpty(peerId))
+                await _rooms.SendToConnectionAsync(peerId, new { type = "PEER_LEFT" });
 
-            Log.Information("[Signal] Client disconnected: {ConnId}", _connectionId);
+            _rooms.CloseRoom(room.Id);
         }
+
+        Log.Information("[Signal] Disconnected: {ConnId}", _connectionId);
     }
 
     private async Task ProcessMessageAsync(string json)
@@ -70,31 +90,21 @@ public class SignalingHandler
             doc = JsonDocument.Parse(json);
             var root = doc.RootElement;
 
-            var type = root.GetProperty("type").GetString();
-            var correlationId = root.TryGetProperty("correlationId", out var corrId)
-                ? corrId.GetString() : null;
-            var data = root.TryGetProperty("data", out var d) ? d : default;
+            var type = root.GetProperty("type").GetString() ?? "";
+            var corrId = root.TryGetProperty("correlationId", out var cEl) ? cEl.GetString() : null;
+            var data = root.TryGetProperty("data", out var dEl) ? dEl : default;
 
-            Log.Debug("[Signal] {ConnId} → {Type}", _connectionId, type);
+            Log.Debug("[Signal] {ConnId} -> {Type}", _connectionId, type);
 
             switch (type)
             {
                 case "CREATE_ROOM":
-                    await HandleCreateRoomAsync(correlationId);
+                    await HandleCreateRoomAsync(corrId);
                     break;
 
                 case "JOIN_ROOM":
-                    var roomId = data.GetProperty("roomId").GetString()!;
-                    await HandleJoinRoomAsync(roomId, correlationId);
-                    break;
-
-                case "SEND_ENDPOINT":
-                    await HandleSendEndpointAsync(data, correlationId);
-                    break;
-
-                case "GET_RELAY":
-                    var relayRoomId = data.GetProperty("roomId").GetString()!;
-                    await HandleGetRelayAsync(relayRoomId, correlationId);
+                    var roomId = data.GetProperty("roomId").GetString()!.Trim().ToUpperInvariant();
+                    await HandleJoinRoomAsync(roomId, corrId);
                     break;
 
                 case "RELAY_PACKET":
@@ -102,16 +112,13 @@ public class SignalingHandler
                     var rPayload = data.TryGetProperty("payload", out var pEl) ? pEl.GetString() : null;
                     if (!string.IsNullOrEmpty(rRoomId) && !string.IsNullOrEmpty(rPayload))
                     {
-                        await _rooms.ForwardToOtherParticipantAsync(_connectionId, rRoomId, new
-                        {
-                            type = "RELAY_PACKET",
-                            data = new { payload = rPayload }
-                        });
+                        await _rooms.ForwardToOtherParticipantAsync(_connectionId, rRoomId,
+                            new { type = "RELAY_PACKET", data = new { payload = rPayload } });
                     }
                     break;
 
                 default:
-                    Log.Warning("[Signal] Unknown message type: {Type}", type);
+                    Log.Warning("[Signal] Unknown message: {Type} from {ConnId}", type, _connectionId);
                     break;
             }
         }
@@ -125,142 +132,53 @@ public class SignalingHandler
         }
     }
 
-    private async Task HandleCreateRoomAsync(string? correlationId)
+    private async Task HandleCreateRoomAsync(string? corrId)
     {
         var room = _rooms.CreateRoom(_connectionId);
-
-        // Assign a local port for host UDP
-        var port = GetRandomPort();
 
         await SendAsync(new
         {
             type = "ROOM_CREATED",
-            correlationId,
-            data = new
-            {
-                roomId = room.Id,
-                port,
-                expiresInMinutes = 30
-            }
+            correlationId = corrId,
+            data = new { roomId = room.Id }
         });
 
-        Log.Information("[Signal] Room {RoomId} created", room.Id);
+        Log.Information("[Signal] Room {RoomId} created by {ConnId}", room.Id, _connectionId);
     }
 
-    private async Task HandleJoinRoomAsync(string roomId, string? correlationId)
+    private async Task HandleJoinRoomAsync(string roomId, string? corrId)
     {
         if (!_rooms.TryJoinRoom(roomId, _connectionId, out var room) || room == null)
         {
             await SendAsync(new
             {
                 type = "ROOM_NOT_FOUND",
-                correlationId,
-                data = new { roomId, reason = "Room not found or expired" }
+                correlationId = corrId,
+                data = new { roomId }
             });
+            Log.Warning("[Signal] Room {RoomId} not found for {ConnId}", roomId, _connectionId);
             return;
         }
 
-        // Send room info to joining client
+        // Confirm to joining client
         await SendAsync(new
         {
             type = "ROOM_JOINED",
-            correlationId,
-            data = new
-            {
-                roomId = room.Id,
-                hostEndpoint = new
-                {
-                    publicEndpoint = room.Host?.PublicEndpoint ?? "",
-                    privateEndpoint = room.Host?.PrivateEndpoint ?? "",
-                    publicKey = room.Host?.PublicKey ?? ""
-                },
-                virtualIp = "10.77.0.2" // Client always gets .2
-            }
+            correlationId = corrId,
+            data = new { roomId = room.Id }
         });
-    }
 
-    private async Task HandleSendEndpointAsync(JsonElement data, string? correlationId)
-    {
-        var roomId = data.GetProperty("roomId").GetString()!;
-        var room = _rooms.GetRoom(roomId);
-        if (room == null) return;
-
-        // Determine if this is host or client
-        var isHost = room.Host?.ConnectionId == _connectionId;
-
-        // Extract endpoint info
-        var endpoint = data.GetProperty("endpoint");
-        var publicEp = endpoint.TryGetProperty("publicEndpoint", out var pub) ? pub.GetString() : _remoteIp;
-        var privateEp = endpoint.TryGetProperty("privateEndpoint", out var priv) ? priv.GetString() : "";
-        var pubKey = endpoint.TryGetProperty("publicKey", out var key) ? key.GetString() : "";
-
-        if (isHost && room.Host != null)
-        {
-            room.Host.PublicEndpoint = publicEp;
-            room.Host.PrivateEndpoint = privateEp;
-            room.Host.PublicKey = pubKey;
-        }
-        else if (!isHost && room.Client != null)
-        {
-            room.Client.PublicEndpoint = publicEp;
-            room.Client.PrivateEndpoint = privateEp;
-            room.Client.PublicKey = pubKey;
-
-            // Now that both have sent endpoints, notify host of client's real endpoint
-            await NotifyHostAsync(room, new
-            {
-                type = $"PEER_JOINED_{roomId}",
-                data = new
-                {
-                    peerEndpoint = new
-                    {
-                        publicEndpoint = publicEp,
-                        privateEndpoint = privateEp,
-                        publicKey = pubKey
-                    }
-                }
-            });
-
-            // Also send host endpoint to client (updated)
-            await SendAsync(new
-            {
-                type = "HOST_ENDPOINT_UPDATE",
-                data = new
-                {
-                    hostEndpoint = new
-                    {
-                        publicEndpoint = room.Host?.PublicEndpoint,
-                        privateEndpoint = room.Host?.PrivateEndpoint,
-                        publicKey = room.Host?.PublicKey
-                    }
-                }
-            });
-        }
-
-        await SendAsync(new { type = "ENDPOINT_RECEIVED", correlationId });
-    }
-
-    private async Task HandleGetRelayAsync(string roomId, string? correlationId)
-    {
-        // Return relay server UDP endpoint
-        // In production, this is the deployed relay server address
-        var relayEndpoint = "relay.genlan.aboadnan.net:7778";
-
-        await SendAsync(new
-        {
-            type = "RELAY_INFO",
-            correlationId,
-            data = new { relayEndpoint, sessionId = Guid.NewGuid().ToString("N") }
-        });
-    }
-
-    private async Task NotifyHostAsync(Room room, object message)
-    {
+        // Immediately notify host that a client joined
         if (!string.IsNullOrEmpty(room.Host?.ConnectionId))
         {
-            await _rooms.SendToConnectionAsync(room.Host.ConnectionId, message);
-            Log.Information("[Signal] Notified host {HostConn} of room {RoomId}", room.Host.ConnectionId, room.Id);
+            await _rooms.SendToConnectionAsync(room.Host.ConnectionId, new
+            {
+                type = "PEER_JOINED",
+                data = new { roomId = room.Id }
+            });
         }
+
+        Log.Information("[Signal] Client {ConnId} joined room {RoomId}", _connectionId, roomId);
     }
 
     private async Task SendAsync(object message)
@@ -282,11 +200,5 @@ public class SignalingHandler
         {
             Log.Warning(ex, "[Signal] Failed to send to {ConnId}", _connectionId);
         }
-    }
-
-    private static int GetRandomPort()
-    {
-        // Return a port in range 47000-48000 for UDP hole punching
-        return Random.Shared.Next(47000, 48000);
     }
 }
