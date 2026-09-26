@@ -22,17 +22,17 @@ public class RoomParticipant
 
 public class Room
 {
-    public const int MAX_PLAYERS = 16;
+    // Hard ceiling of the 10.77.0.0/24 virtual subnet: slots 1..254
+    // (1 = host, 2..254 = the remaining /24 hosts; .255 is the broadcast address).
+    public const int MAX_PLAYERS = 254;
 
     public string Id { get; set; } = "";
     public string HostConnectionId { get; set; } = "";
     public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
-    public DateTime ExpiresAt { get; set; } = DateTime.UtcNow.AddHours(2);
     public ConcurrentDictionary<string, RoomParticipant> Participants { get; } = new();
     private readonly HashSet<int> _usedSlots = new();
     private readonly object _lock = new();
 
-    public bool IsExpired => DateTime.UtcNow > ExpiresAt;
     public bool IsFull => Participants.Count >= MAX_PLAYERS;
     public int PlayerCount => Participants.Count;
 
@@ -91,22 +91,16 @@ public class Room
 }
 
 /// <summary>
-/// In-memory room manager supporting up to 16 players per room.
+/// In-memory room manager. Rooms live until their host disconnects (or the host
+/// closes the app): there is no time-based expiry.
 /// </summary>
 public class RoomManager
 {
     private readonly ConcurrentDictionary<string, Room> _rooms = new();
     private readonly ConcurrentDictionary<string, WebSocket> _sockets = new();
-    private readonly Timer _cleanupTimer;
 
     private const string CODE_CHARS = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
     private const int CODE_LENGTH = 5;
-
-    public RoomManager()
-    {
-        _cleanupTimer = new Timer(_ => CleanupExpiredRooms(), null,
-            TimeSpan.FromMinutes(5), TimeSpan.FromMinutes(5));
-    }
 
     public void RegisterSocket(string connectionId, WebSocket ws) => _sockets[connectionId] = ws;
     public void UnregisterSocket(string connectionId) => _sockets.TryRemove(connectionId, out _);
@@ -172,11 +166,6 @@ public class RoomManager
     public Room? GetRoom(string roomId)
     {
         _rooms.TryGetValue(roomId.ToUpperInvariant(), out var room);
-        if (room?.IsExpired == true)
-        {
-            _rooms.TryRemove(roomId.ToUpperInvariant(), out _);
-            return null;
-        }
         return room;
     }
 
@@ -193,15 +182,15 @@ public class RoomManager
 
         if (room.IsFull)
         {
-            Log.Warning("[RoomManager] Room {RoomId} is full (16 players)", roomId);
+            Log.Warning("[RoomManager] Room {RoomId} is full ({MaxPlayers} players)", roomId, Room.MAX_PLAYERS);
             return false;
         }
 
         participant = room.AddParticipant(connectionId, isHost: false);
         if (participant == null) return false;
 
-        Log.Information("[RoomManager] Player {ConnectionId} joined room {RoomId} (Assigned IP: {Ip}, Total: {Count}/16)",
-            connectionId, roomId, participant.VirtualIp, room.PlayerCount);
+        Log.Information("[RoomManager] Player {ConnectionId} joined room {RoomId} (Assigned IP: {Ip}, Total: {Count}/{MaxPlayers})",
+            connectionId, roomId, participant.VirtualIp, room.PlayerCount, Room.MAX_PLAYERS);
         return true;
     }
 
@@ -226,15 +215,5 @@ public class RoomManager
             chars[i] = CODE_CHARS[bytes[i] % CODE_CHARS.Length];
 
         return "GEN-" + new string(chars);
-    }
-
-    private void CleanupExpiredRooms()
-    {
-        var expired = _rooms.Where(kv => kv.Value.IsExpired).Select(kv => kv.Key).ToList();
-        foreach (var key in expired)
-        {
-            _rooms.TryRemove(key, out _);
-            Log.Debug("[RoomManager] Expired room {RoomId} cleaned up", key);
-        }
     }
 }

@@ -10,7 +10,7 @@ using Serilog;
 namespace GenLAN.Server.Signaling;
 
 /// <summary>
-/// Handles one WebSocket connection for the 16-player virtual LAN.
+/// Handles one WebSocket connection for the shared virtual LAN room.
 /// </summary>
 public class SignalingHandler
 {
@@ -90,6 +90,8 @@ public class SignalingHandler
                             peers = remainingIps
                         }
                     });
+
+                    await _rooms.BroadcastToAllInRoomAsync(room.Id, BuildPlayerListMessage(room));
                 }
                 else
                 {
@@ -167,6 +169,7 @@ public class SignalingHandler
                 roomId = room.Id,
                 virtualIp = host.VirtualIp,
                 totalPlayers = room.PlayerCount,
+                maxPlayers = Room.MAX_PLAYERS,
                 peers = new[] { host.VirtualIp }
             }
         });
@@ -200,6 +203,7 @@ public class SignalingHandler
                 roomId = room.Id,
                 virtualIp = participant.VirtualIp,
                 totalPlayers = room.PlayerCount,
+                maxPlayers = Room.MAX_PLAYERS,
                 peers = allIps
             }
         });
@@ -217,8 +221,30 @@ public class SignalingHandler
             }
         });
 
-        Log.Information("[Signal] Player {ConnId} joined room {RoomId} (Assigned IP: {Ip}, Total: {Count}/16)",
-            _connectionId, roomId, participant.VirtualIp, room.PlayerCount);
+        // 3. Authoritative roster push to everyone (including the joiner), so every
+        //    client always renders the complete player list of the virtual LAN.
+        await _rooms.BroadcastToAllInRoomAsync(room.Id, BuildPlayerListMessage(room));
+
+        Log.Information("[Signal] Player {ConnId} joined room {RoomId} (Assigned IP: {Ip}, Total: {Count}/{MaxPlayers})",
+            _connectionId, roomId, participant.VirtualIp, room.PlayerCount, Room.MAX_PLAYERS);
+    }
+
+    private static object BuildPlayerListMessage(Room room)
+    {
+        return new
+        {
+            type = "PLAYER_LIST",
+            data = new
+            {
+                roomId = room.Id,
+                totalPlayers = room.PlayerCount,
+                maxPlayers = Room.MAX_PLAYERS,
+                players = room.Participants.Values
+                    .OrderBy(p => p.IpSlot)
+                    .Select(p => new { virtualIp = p.VirtualIp, isHost = p.IsHost })
+                    .ToList()
+            }
+        };
     }
 
     private async Task SendAsync(object message)
